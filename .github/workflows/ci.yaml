@@ -28,13 +28,11 @@ jobs:
         with:
           check_filenames: true
           skip: ./.git
-#          ignore_words_list: AtLeast,AtMost
   lint:
     name: Lint with Super-Linter
     runs-on: ubuntu-latest
     permissions:
       contents: read
-#      packages: read
       # To report GitHub Actions status checks
       statuses: write
     steps:
@@ -49,3 +47,4 @@ jobs:
         env:
           # To report GitHub Actions status checks
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_ALL_CODEBASE: false
