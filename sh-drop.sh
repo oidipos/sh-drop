@@ -1,124 +1,154 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# sh-drop — Fetch Spamhaus DROP lists and load them into ipsets atomically.
+#
 
-# Adjust the values of the following variables
-TMP_DIR="/home/ubuntu/sh-drop/"
+set -euo pipefail
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+TMP_DIR="/home/ubuntu/sh-drop"
+IPSET_V4="drop_v4"
+IPSET_V6="drop_v6"
+CHAIN_NAME="MAILCOW"  # iptables chain to hook into
+
+# ─── Functions ────────────────────────────────────────────────────────────────
 
 show_help() {
-  echo "Usage: $0 [OPTIONS]"
-  echo
-  echo "Options:"
-  echo "  --skip-download      Skip downloading of Spamhaus DROP, use last output file"
-  echo "  -h, --help           Show this help message"
+  cat <<EOF
+Usage: ${0##*/} [OPTIONS]
+
+Options:
+  --skip-download   Skip downloading Spamhaus DROP lists; reuse cached files
+  -h, --help        Show this help message
+EOF
 }
 
-SKIP_DOWNLOAD=false
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+require_cmd() {
+  local cmd
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null 2>&1 \
+      || die "Required command '${cmd}' not found. Please install it."
+  done
+}
+
+# Download a single blocklist, with basic validation.
+download_list() {
+  local name="$1"
+  local url="https://www.spamhaus.org/drop/${name}.json"
+  local dest="${TMP_DIR}/${name}.json"
+
+  if ! curl -sSfL -o "${dest}" "${url}"; then
+    die "Failed to download ${url}"
+  fi
+
+  # Sanity-check: the file must contain valid JSON with at least one entry.
+  if ! jq -e 'length > 0' "${dest}" >/dev/null 2>&1; then
+    die "Downloaded file ${dest} is empty or not valid JSON."
+  fi
+}
+
+# Populate a temporary ipset from a JSON file, then atomically swap it in.
+load_ipset() {
+  local name="$1"      # e.g. drop_v4
+  local family="$2"    # inet | inet6
+  local json="${TMP_DIR}/${name}.json"
+  local tmp_name="${name}_tmp"
+
+  # Ensure the live set exists.
+  if ! ipset list "$name" &>/dev/null; then
+    echo "Creating ipset ${name} (${family})"
+    ipset create "$name" hash:net family "$family"
+  fi
+
+  # (Re)create a temporary set to stage the new data.
+  ipset destroy "$tmp_name" 2>/dev/null || true
+  ipset create "$tmp_name" hash:net family "$family"
+
+  # Populate the temporary set.
+  local count=0
+  while IFS= read -r cidr; do
+    ipset add "$tmp_name" "$cidr"
+    (( ++count ))
+  done < <(jq -r 'select(.cidr != null) | .cidr' "$json")
+
+  echo "Loaded ${count} entries into ${tmp_name}"
+
+  # Atomic swap: the live set instantly contains the new data.
+  ipset swap "$tmp_name" "$name"
+  ipset destroy "$tmp_name"
+
+  echo "Swapped ${tmp_name} → ${name}"
+}
+
+# Ensure an iptables/ip6tables rule sits at position 1 in the given chain.
+ensure_rule_at_top() {
+  local chain="$1"
+  local rule="$2"
+  local cmd="$3"  # iptables | ip6tables
+
+  # shellcheck disable=SC2086
+  if ! $cmd -C "$chain" $rule 2>/dev/null; then
+    # Rule doesn't exist — insert at top.
+    $cmd -I "$chain" 1 $rule
+  else
+    # Rule exists — check whether it's already the first rule.
+    local first_rule
+    first_rule=$($cmd -S "$chain" | sed -n '2p')
+    if [[ "$first_rule" != *"$rule"* ]]; then
+      $cmd -D "$chain" $rule
+      $cmd -I "$chain" 1 $rule
+    fi
+  fi
+}
+
+# ─── Argument parsing ────────────────────────────────────────────────────────
+
+skip_download=false
 
 for arg in "$@"; do
-  case $arg in
-    --skip-download)
-      SKIP_DOWNLOAD=true
-      ;;
-    -h|--help)
-      show_help
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $arg"
-      show_help
-      exit 1
-      ;;
+  case "$arg" in
+    --skip-download) skip_download=true ;;
+    -h|--help)       show_help; exit 0  ;;
+    *)               die "Unknown option: ${arg}" ;;
   esac
 done
 
-# Check if required packages are installed
-for cmd in ipset jq; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "$cmd NOT found, please install package."
-    exit 1
-  fi
-done
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
-if [ "$SKIP_DOWNLOAD" = false ]
-then
-  echo "Retrieve IPs from Spamhaus DROP BL..."
+require_cmd curl jq ipset iptables ip6tables
+
+mkdir -p "$TMP_DIR"
+
+# 1. Obtain blocklists
+if [[ "$skip_download" == true ]]; then
+  echo "Skipping download — reusing cached files."
   for bl in drop_v4 drop_v6; do
-    curl -sG https://www.spamhaus.org/drop/${bl}.json \
-      -o ${TMP_DIR}/${bl}.json
-
-    # Capture the exit code
-    exit_code=$?
-
-    # Check for error
-    if [ $exit_code -ne 0 ]; then
-      echo "Curl encountered an error with exit code $exit_code while retrieving the Spamhaus DROP IPs."
-      exit 1
-    fi
+    [[ -f "${TMP_DIR}/${bl}.json" ]] \
+      || die "Cached file ${TMP_DIR}/${bl}.json does not exist."
   done
 else
-  for bl in drop_v4 drop_v6; do
-    if [ ! -f ${TMP_DIR}/${bl}.json ]; then
-      echo "Skipping download but file ${TMP_DIR}/${bl}.json does not exist."
-      exit 1
-    fi
-  done
-  echo "Skipping download of Spamhaus DROP BL."
+  echo "Downloading Spamhaus DROP lists…"
+  download_list drop_v4
+  download_list drop_v6
 fi
 
-IPSET_V4="drop_v4"
-IPSET_V6="drop_v6"
+# 2. Load ipsets atomically
+echo "Loading ipsets…"
+load_ipset "$IPSET_V4" inet
+load_ipset "$IPSET_V6" inet6
 
-echo "Ensure ipsets exist"
-# Create IPv4 ipset if missing
-if ! ipset list $IPSET_V4 &>/dev/null; then
-  echo "Creating ipset $IPSET_V4"
-  ipset create $IPSET_V4 hash:net family inet
-fi
-# Create IPv6 ipset if missing
-if ! ipset list $IPSET_V6 &>/dev/null; then
-  echo "Creating ipset $IPSET_V6"
-  ipset create $IPSET_V6 hash:net family inet6
-fi
+# 3. Ensure iptables rules are in place
+echo "Ensuring iptables rules…"
+ensure_rule_at_top "$CHAIN_NAME" "-m set --match-set ${IPSET_V4} src -j DROP" iptables
+ensure_rule_at_top "$CHAIN_NAME" "-m set --match-set ${IPSET_V6} src -j DROP" ip6tables
 
-echo "Flush existing ipsets"
-ipset flush $IPSET_V4
-ipset flush $IPSET_V6
-
-echo "Process entries and add to ipset"
-while IFS= read -r ip; do
-  ipset add $IPSET_V4 "$ip" 2>/dev/null
-done < <(jq -r 'select(.cidr != null) | .cidr' ${TMP_DIR}/drop_v4.json)
-while IFS= read -r ip; do
-  ipset add $IPSET_V6 "$ip" 2>/dev/null
-done < <(jq -r 'select(.cidr != null) | .cidr' ${TMP_DIR}/drop_v6.json)
-
-echo "Ensure ip(6)tables rules exist at the top"
-
-ensure_rule_at_top() {
-  local chain=$1
-  local rule=$2
-  local cmd=$3  # iptables or ip6tables
-
-  if ! $cmd -S $chain | grep -q -- "$rule"; then
-    eval "$cmd -I $chain 1 $rule"  # Add rule if missing
-  else
-    FIRST_RULE=$($cmd -S $chain | sed -n '2p')
-    if [[ "$FIRST_RULE" != *"$rule"* ]]; then
-      eval "$cmd -D $chain $rule"  # Remove old rule
-      eval "$cmd -I $chain 1 $rule"  # Reinsert at the top
-    fi
-  fi
-}
-
-# iptables variables
-CHAIN_NAME="MAILCOW" # DO NOT CHANGE THIS UNTIL YOU KNOW WHAT YOU'RE DOING! :)
-
-IPTABLES_RULE_V4="-m set --match-set $IPSET_V4 src -j DROP"
-IPTABLES_RULE_V6="-m set --match-set $IPSET_V6 src -j DROP"
-
-ensure_rule_at_top "$CHAIN_NAME" "$IPTABLES_RULE_V4" "iptables"
-ensure_rule_at_top "$CHAIN_NAME" "$IPTABLES_RULE_V6" "ip6tables"
-
-# Save ipset rules to persist across reboots
+# 4. Persist ipset across reboots
 ipset save > /etc/ipset.rules
 
-echo -e "\n\nDone.\n\nCheck current iplist entries with 'sudo ipset list | less'"
+echo ""
+echo "Done. Inspect with: sudo ipset list | less"
