@@ -46,9 +46,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: MegaLinter
-        uses: oxsecurity/megalinter/flavors/ci_light@8fbdead70d1409964ab3d5afa885e18ee85388bb #v9.4.0
+        uses: oxsecurity/megalinter/flavors/documentation@8fbdead70d1409964ab3d5afa885e18ee85388bb #v9.4.0
         env:
           # To report GitHub Actions status checks
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VALIDATE_ALL_CODEBASE: false
+          GITHUB_COMMENT_REPORTER: false
+          GITHUB_STATUS_REPORTER: true
           BASH_SHFMT_ARGUMENTS: -i 2 -ci
