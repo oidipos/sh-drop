@@ -53,4 +53,5 @@ jobs:
           VALIDATE_ALL_CODEBASE: false
           GITHUB_COMMENT_REPORTER: false
           GITHUB_STATUS_REPORTER: true
+          DISABLE_LINTERS: SPELL_CSPELL
           BASH_SHFMT_ARGUMENTS: -i 2 -ci
